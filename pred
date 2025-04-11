@@ -1,0 +1,85 @@
+import pandas as pd
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Model
+
+# 讀取資料
+file_path = r''
+data = pd.read_csv(file_path, low_memory=False)
+
+# 篩選需要的欄位
+selected_columns = ['reviews.username', 'id', 'name', 'brand', 'categories', 'reviews.rating', 'reviews.doRecommend', 'reviews.text']
+data = data[selected_columns]
+
+# 填補缺失值
+def fill_username_na(series):
+    return series.fillna('anonymous')
+
+def fill_name_na(df, id_col, name_col):
+    name_dict = df.dropna(subset=[id_col, name_col]).drop_duplicates(subset=[id_col])[
+        [id_col, name_col]
+    ].set_index(id_col)[name_col].to_dict()
+    df[name_col] = df.apply(
+        lambda row: name_dict.get(row[id_col]) if pd.isna(row[name_col]) and row[id_col] in name_dict else row[name_col],
+        axis=1,
+    )
+    return df
+
+data['reviews.username'] = fill_username_na(data['reviews.username'])
+data = fill_name_na(data, 'id', 'name')
+data = data.dropna(subset=['reviews.rating'])
+
+# 建立用戶與商品ID映射
+user_ids = data['reviews.username'].unique()
+item_ids = data['id'].unique()
+
+user_id_map = {user: i for i, user in enumerate(user_ids)}
+item_id_map = {item: i for i, item in enumerate(item_ids)}
+
+data['user_id'] = data['reviews.username'].map(user_id_map)
+data['item_id'] = data['id'].map(item_id_map)
+#============================================================================================================================
+model_path = 'dnn_double_tower_GP_v5.h5'
+loaded_model = tf.keras.models.load_model(model_path)
+
+target_username = 'Adapter'  # 請替換成你想要推薦的用戶名稱
+K = 10
+
+# 檢查目標用戶是否存在於測試集中
+if target_username not in user_id_map:
+    print(f"User '{target_username}' not found in test data.")
+else:
+    # 獲取目標用戶的內部 ID
+    target_user_id = user_id_map[target_username]
+ 
+    # 生成目標用戶對所有物品的預測分數
+    user_preds = loaded_model.predict([np.array([target_user_id] * len(item_ids)), np.arange(len(item_ids))])[0].flatten()
+ 
+    # 獲取 Top-K 推薦物品的索引 (這些索引對應到 item_ids 列表)
+    top_item_indices = np.argsort(-user_preds)[:K]
+    
+    # 顯示 Top-K 推薦結果
+    print(f"User '{target_username}' Top {K} items: {top_item_indices}")
+    
+     # 使用索引獲取原始的 Top-K 推薦物品 ID
+    recommended_item_original_ids = [item_ids[i] for i in top_item_indices]
+    
+     # 創建一個從原始商品 ID 到商品名稱的映射
+    item_name_map_original_id = data.set_index('id')['name'].to_dict()
+
+    # 使用原始商品 ID 獲取商品名稱
+    recommended_item_names = [item_name_map_original_id.get(item_id) for item_id in recommended_item_original_ids]
+
+    for product in recommended_item_names:
+        print(product)
+ 
+    # 將推薦結果放入 pandas DataFrame
+    recommendation_table = pd.DataFrame({
+        'Rank': range(1, K + 1),
+        'Original ID': recommended_item_original_ids,
+        'Name': recommended_item_names
+    })
+ 
+    # 顯示表格
+    print(f"User '{target_username}' Top {K} Recommendations:")
+    print(recommendation_table)
