@@ -1,0 +1,303 @@
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.layers import Input, Embedding, Dense, Flatten, Concatenate, Dropout, BatchNormalization, Add, PReLU, LayerNormalization
+from tensorflow.keras.models import Model
+from sklearn.metrics import roc_auc_score
+from tensorflow.keras.regularizers import l2
+
+def fill_username_na(series):
+    """將 reviews.username 欄位中的空值替換為 author1, author2, ..."""
+    author_count = 1
+    def replace_na(value):
+        nonlocal author_count  # 使用 nonlocal 關鍵字來修改外部變數
+        if pd.isna(value):
+            new_value = f"author{author_count}"
+            author_count += 1
+            return new_value
+        return value
+    return series.apply(replace_na)
+
+def fill_name_na(df, id_col, name_col):
+    """
+    根據 id 欄位，將 name 欄位的空值填補為 product1, product2, ...
+
+    Args:
+        df (pd.DataFrame): 輸入的 DataFrame。
+        id_col (str): 包含唯一 ID 的欄位名稱。
+        name_col (str): 需要填補空值的欄位名稱。
+
+    Returns:
+        pd.DataFrame: 填補空值後的 DataFrame。
+    """
+    id_to_product = {}
+    product_counter = 1
+
+    for unique_id in df[id_col].unique():
+        names_for_id = df[df[id_col] == unique_id][name_col].tolist()
+
+        if any(pd.isnull(name) for name in names_for_id):
+            if unique_id not in id_to_product:
+                id_to_product[unique_id] = f'product{product_counter}'
+                product_counter += 1
+
+    def fill_na(row):
+        if pd.isnull(row[name_col]):
+            return id_to_product.get(row[id_col])
+        return row[name_col]
+
+    df[name_col] = df.apply(fill_na, axis=1)
+    return df
+
+# 讀取資料
+file_path = 
+data = pd.read_csv(file_path, low_memory=False)
+
+# 篩選需要的欄位
+selected_columns = ['reviews.username', 'id', 'name', 'brand', 'categories', 'reviews.rating', 'reviews.doRecommend', 'reviews.text']
+data = data[selected_columns]
+
+data['reviews.username'] = fill_username_na(data['reviews.username'])
+data = fill_name_na(data, 'id', 'name')
+data = data.dropna(subset=['reviews.rating'])
+
+# === 用戶特徵擴充 ===
+user_stats = data.groupby('reviews.username').agg(
+    user_avg_rating=('reviews.rating', 'mean'),
+    user_recommend_rate=('reviews.doRecommend', 'mean')
+).reset_index()
+
+# 合併用戶統計特徵
+data = pd.merge(data, user_stats, on='reviews.username', how='left')
+
+# === 數值特徵標準化 ===
+scaler = MinMaxScaler()
+num_features = ['user_avg_rating', 'user_recommend_rate']
+data[num_features] = scaler.fit_transform(data[num_features])
+
+# 建立用戶與商品ID映射
+user_ids = data['reviews.username'].unique()
+item_ids = data['id'].unique()
+
+user_id_map = {user: i for i, user in enumerate(user_ids)}
+item_id_map = {item: i for i, item in enumerate(item_ids)}
+
+data['user_id'] = data['reviews.username'].map(user_id_map)
+data['item_id'] = data['id'].map(item_id_map)
+
+# 創建正負樣本
+data['label'] = (data['reviews.rating'] >= 4).astype(int)
+positive_samples = data[data['label'] == 1]
+negative_samples = data[data['label'] == 0]
+
+# 保留每個用戶至少1個負樣本
+balanced_data = []
+for user_id in data['user_id'].unique():
+    user_data = data[data['user_id'] == user_id]
+    pos_samples = user_data[user_data['label'] == 1]
+    neg_samples = user_data[user_data['label'] == 0]
+    
+    if len(neg_samples) == 0:
+        neg_samples = negative_samples.sample(1, random_state=42)
+    elif len(neg_samples) < len(pos_samples):
+        neg_samples = neg_samples.sample(len(pos_samples), replace=True, random_state=42)
+    
+    user_final_data = pd.concat([pos_samples, neg_samples])
+    balanced_data.append(user_final_data)
+
+final_data = pd.concat(balanced_data).sample(frac=1).reset_index(drop=True)
+
+# 计算每个用户的评论数
+user_review_counts = final_data['user_id'].value_counts().to_dict()
+final_data['user_review_count'] = final_data['user_id'].map(user_review_counts)
+
+# 设定权重：低活跃用户权重大，高活跃用户权重小
+# 使用对数缩放，避免极端权重
+max_count = final_data['user_review_count'].max()
+final_data['sample_weight'] = np.log(1 + max_count / (final_data['user_review_count'] + 1))
+
+# 處理 brand - One-Hot Encoding
+brand_ohe = pd.get_dummies(final_data['brand'], prefix='brand')
+final_data = pd.concat([final_data, brand_ohe], axis=1).drop(columns=['brand'])
+
+# 分割訓練與測試資料
+train_data, test_data = train_test_split(final_data, test_size=0.2, random_state=42)
+
+# 重置索引確保一致
+train_data = train_data.reset_index(drop=True)
+test_data = test_data.reset_index(drop=True)
+
+# 處理 categories - Target Encoding
+kf = KFold(n_splits=5, shuffle=True, random_state=42)
+train_data['categories_te'] = 0
+for train_idx, val_idx in kf.split(train_data):
+    train_fold = train_data.iloc[train_idx]
+    val_fold = train_data.iloc[val_idx]
+    te_map = train_fold.groupby('categories')['label'].mean()
+    train_data.loc[val_idx, 'categories_te'] = val_fold['categories'].map(te_map)
+train_data['categories_te'].fillna(train_data['label'].mean(), inplace=True)
+
+te_map_test = train_data.groupby('categories')['label'].mean()
+test_data['categories_te'] = test_data['categories'].map(te_map_test)
+test_data['categories_te'].fillna(train_data['label'].mean(), inplace=True)
+
+train_data.drop(columns=['categories'], inplace=True)
+test_data.drop(columns=['categories'], inplace=True)
+
+# 定義 ResNet Shortcut block
+def resnet_block_v2(x, units):
+    shortcut = Dense(units)(x)
+    x = Dense(units)(x)
+    x = LayerNormalization()(x)
+    x = PReLU()(x)
+    x = Dense(units)(x)
+    x = Add()([x, shortcut])
+    x = PReLU()(x)
+    return x
+
+# 雙塔模型架構
+embedding_dim = 64
+
+# 用戶塔
+user_input = Input(shape=(1,), name='user_input')
+user_embedding = Embedding(input_dim=len(user_ids), output_dim=embedding_dim)(user_input)
+user_flatten = Flatten()(user_embedding)
+
+user_dense = resnet_block_v2(user_flatten, 128)
+user_dense = Dropout(0.3)(user_dense)
+user_dense = resnet_block_v2(user_dense, 64)
+
+# 商品塔
+item_input = Input(shape=(1,), name='item_input')
+item_embedding = Embedding(input_dim=len(item_ids), output_dim=embedding_dim)(item_input)
+item_flatten = Flatten()(item_embedding)
+item_dense = resnet_block_v2(item_flatten, 128)
+item_dense = Dropout(0.3)(item_dense)
+item_dense = resnet_block_v2(item_dense, 64)
+
+# 合併用戶塔和商品塔
+merged = Concatenate()([user_dense, item_dense])
+final_dense = Dense(128, activation='relu')(merged)
+final_dropout = Dropout(0.5)(final_dense)
+
+# 多任務輸出層
+output_main = Dense(1, activation='sigmoid', name='main_output')(final_dropout)
+output_aux = Dense(1, activation='sigmoid', name='aux_output')(final_dropout)
+
+# 建立模型
+lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+    initial_learning_rate=0.001,
+    decay_steps=5000,
+    decay_rate=0.95,
+    staircase=True
+)
+
+model = Model(inputs=[user_input, item_input], outputs=[output_main, output_aux])
+model.compile(optimizer=tf.keras.optimizers.AdamW(learning_rate=lr_schedule), 
+              loss={'main_output': 'binary_crossentropy', 'aux_output': 'mse'}, 
+              loss_weights={'main_output': 1.0, 'aux_output': 0.3}, 
+              metrics={'main_output': ['AUC']})
+
+# TensorBoard 設置
+log_dir = os.path.join(r"", "fit", pd.Timestamp.now().strftime("%Y%m%d-%H%M%S"))
+tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir, histogram_freq=1)
+
+# 訓練模型
+history = model.fit(
+    [train_data['user_id'], 
+     train_data['item_id'], 
+     train_data[num_features],  # 用戶數值特徵
+     train_data[['categories_te']],  # 商品數值特徵
+     train_data[brand_ohe.columns]],  # 品牌 One-Hot 特徵
+    {'main_output': train_data['label'], 'aux_output': train_data['reviews.rating'] / 5},
+    sample_weight=train_data['sample_weight'],  # 加入样本权重
+    validation_data=(
+        [test_data['user_id'], 
+         test_data['item_id'], 
+         test_data[num_features], 
+         test_data[['categories_te']], 
+         test_data[brand_ohe.columns]],
+        {'main_output': test_data['label'], 'aux_output': test_data['reviews.rating'] / 5}
+    ),
+    epochs=200, batch_size=256,
+    callbacks=[tf.keras.callbacks.EarlyStopping(patience=10, restore_best_weights=True), 
+               tf.keras.callbacks.ReduceLROnPlateau(monitor='val_main_output_auc', mode='max', factor=0.3, patience=5, min_lr=0.00001), 
+               tensorboard_callback]
+)
+
+# 評估模型
+pred_probs = model.predict([
+    test_data['user_id'],
+    test_data['item_id'],
+    test_data[num_features],
+    test_data[['categories_te']],
+    test_data[brand_ohe.columns]
+])[0].flatten()
+if len(test_data['label'].unique()) < 2:
+    print("⚠️ 測試集只包含一種類別，無法計算 AUC。")
+else:
+    auc = roc_auc_score(test_data['label'], pred_probs)
+
+# GAUC計算
+def calculate_gauc(data, preds):
+    user_gauc_scores = []
+    for user_id in data['user_id'].unique():
+        user_data = data[data['user_id'] == user_id].reset_index(drop=True)
+        user_preds = preds[user_data.index]
+        if len(user_data['label'].unique()) == 2:
+            try:
+                user_gauc_scores.append(roc_auc_score(user_data['label'], user_preds))
+            except ValueError:
+                continue
+    return np.mean(user_gauc_scores) if user_gauc_scores else 0
+
+gauc = calculate_gauc(test_data, pred_probs)
+
+# 計算Recall@K
+def recall_at_k(data, preds, k=10):
+    hits = 0
+    for user_id in data['user_id'].unique():
+        user_data = data[data['user_id'] == user_id].reset_index(drop=True)
+        if user_data['label'].sum() > 0:
+            top_k_items = user_data.iloc[np.argsort(-preds[user_data.index])][:k]
+            hits += top_k_items['label'].sum()
+    total_positive = data['label'].sum()
+    return hits / total_positive
+
+recall_10 = recall_at_k(test_data, pred_probs, k=10)
+
+# 計算AverageRank
+def average_rank(data, preds):
+    ranks = []
+    for user_id in data['user_id'].unique():
+        user_data = data[data['user_id'] == user_id].reset_index(drop=True)
+        positive_items = user_data[user_data['label'] == 1]
+        for _, row in positive_items.iterrows():
+            sorted_items = user_data.iloc[np.argsort(-preds[user_data.index])]
+            rank = sorted_items[sorted_items['item_id'] == row['item_id']].index[0] + 1
+            ranks.append(rank)
+    return np.mean(ranks)
+
+avg_rank = average_rank(test_data, pred_probs)
+
+# 計算NDCG@K
+def ndcg_at_k(data, preds, k=10):
+    ndcg_scores = []
+    for user_id in data['user_id'].unique():
+        user_data = data[data['user_id'] == user_id].reset_index(drop=True)
+        sorted_items = user_data.iloc[np.argsort(-preds[user_data.index])]
+        dcg = (sorted_items['label'].iloc[:k] / np.log2(np.arange(2, len(sorted_items['label'].iloc[:k]) + 2))).sum()
+        ideal_sorted = user_data.sort_values('label', ascending=False)
+        idcg = (ideal_sorted['label'].iloc[:k] / np.log2(np.arange(2, len(ideal_sorted['label'].iloc[:k]) + 2))).sum()
+        ndcg_scores.append(dcg / idcg if idcg > 0 else 0)
+    return np.mean(ndcg_scores)
+
+ndcg_10 = ndcg_at_k(test_data, pred_probs, k=10)
+
+
+# 輸出評估結果
+print(f"模型評估 AUC: {auc:.4f}, GAUC: {gauc:.4f}, Recall@10: {recall_10:.4f}, AverageRank: {avg_rank:.2f}, NDCG@10: {ndcg_10:.4f}")
